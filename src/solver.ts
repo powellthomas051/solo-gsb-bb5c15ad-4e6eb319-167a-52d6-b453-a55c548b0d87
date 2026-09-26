@@ -931,12 +931,24 @@ function readNonNegativeInt(value: unknown): { ok: true; n: number } | { ok: fal
 interface ValidatedCapacityQuery {
   supplyCapList: { supply: string; cap: number }[];
   demandList: { outlet: string; demand: number }[];
+  /** 去重后供给上限的精确合计（BigInt，避免 Number 累加舍入） */
+  totalSupplyCapExact: bigint;
+  /** 去重后出口需求的精确合计（BigInt，避免 Number 累加舍入） */
+  totalDemandExact: bigint;
 }
 
 /**
- * 供水能力类查询（核验与增容建议共用）的校验：节点存在性、
- * 供给上限与需求量必须为非负整数。
- * 返回按输入顺序去重后的上限 / 需求清单；有错误时 valid 缺省。
+ * 供水能力类查询（核验、重点优先配水、增容建议、双阀风险、复水顺序与应急送水
+ * 布点共用）的校验：节点存在性、供给上限与需求量必须为非负整数。
+ * 返回按输入顺序去重后的上限 / 需求清单，以及用 BigInt 精确累加的两类合计；
+ * 有错误时 valid 缺省。
+ *
+ * 单项非负整数校验之外，还必须精确核对去重后的「供给上限合计」与「出口需求合计」：
+ * 单项均为安全整数时，Number 逐项相加仍可能超出 Number.MAX_SAFE_INTEGER
+ * （如三个互不连通出口各填 9007199254740991），Number 累加会舍入，
+ * 导致总需求、总缺口等业务结论错误。合计恰为 9007199254740991 仍可精确表示，
+ * 照常计算；严格超出安全整数范围时按类别明确报错并拒绝计算，六个功能均不再
+ * 展示任何经舍入得到的业务结论。
  */
 function validateCapacityQuery(
   network: Network,
@@ -989,8 +1001,33 @@ function validateCapacityQuery(
     demandList.push({ outlet: o, demand: parsed.n });
   }
 
+  // 单项错误与合计错误一并保留；单项不合格时合计无意义，不再累加
   if (errors.length > 0) return { errors };
-  return { valid: { supplyCapList, demandList }, errors: [] };
+
+  // 去重后的供给上限 / 出口需求精确合计：BigInt 累加杜绝 Number 舍入
+  let totalSupplyCapExact = 0n;
+  for (const { cap } of supplyCapList) totalSupplyCapExact += BigInt(cap);
+  let totalDemandExact = 0n;
+  for (const { demand } of demandList) totalDemandExact += BigInt(demand);
+
+  const MAX_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
+  if (totalSupplyCapExact > MAX_SAFE) {
+    errors.push(
+      `各供水点供给上限合计为 ${totalSupplyCapExact.toString(10)}，` +
+      `超出 Number 安全整数范围（上限 ${Number.MAX_SAFE_INTEGER}）；` +
+      '普通数字累加会发生舍入，无法给出精确的总供给结论，请调小各供水点供给上限后重试。'
+    );
+  }
+  if (totalDemandExact > MAX_SAFE) {
+    errors.push(
+      `各保供出口需求量合计为 ${totalDemandExact.toString(10)}，` +
+      `超出 Number 安全整数范围（上限 ${Number.MAX_SAFE_INTEGER}）；` +
+      '普通数字累加会发生舍入，无法给出精确的总需求与缺口结论，请调小各出口需求量后重试。'
+    );
+  }
+
+  if (errors.length > 0) return { errors };
+  return { valid: { supplyCapList, demandList, totalSupplyCapExact, totalDemandExact }, errors: [] };
 }
 
 /**
@@ -1141,8 +1178,10 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
     return a.id.localeCompare(b.id, 'zh-Hans-CN');
   });
 
-  const totalSupplyCap = supplyCapList.reduce((sum, x) => sum + x.cap, 0);
-  const totalDemand = demandList.reduce((sum, x) => sum + x.demand, 0);
+  const totalSupplyCap = Number(valid.totalSupplyCapExact);
+  const totalDemand = Number(valid.totalDemandExact);
+  // 割容量各项非负，且合计恒等于总获配（≤ min(供给上限合计, 需求合计)，
+  // 两类合计已在共用校验中限定为安全整数），Number 累加精确无舍入。
   const cutCapacity = cutItems.reduce((sum, x) => sum + x.capacity, 0);
 
   return {
@@ -1261,9 +1300,12 @@ export function verifyPriorityCapacity(network: Network, query: CapacityQuery): 
   });
 
   const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
-  const totalSupplyCap = sum(supplyCapList.map((x) => x.cap));
-  const totalDemand = sum(demandList.map((x) => x.demand));
+  // 总供给上限 / 总需求取共用校验中的 BigInt 精确合计，杜绝 Number 累加舍入
+  const totalSupplyCap = Number(valid.totalSupplyCapExact);
+  const totalDemand = Number(valid.totalDemandExact);
+  // 重点需求是总需求的子集（各项非负），不超过已校验为安全整数的需求合计
   const priorityDemand = sum(demandList.filter((d) => prioritySet.has(d.outlet)).map((d) => d.demand));
+  // 普通获配是总获配的子集，总获配不超过安全整数范围内的两类合计
   const normalAllocated = sum(
     rows.filter((r) => r.category === 'normal').map((r) => r.allocated)
   );
@@ -1949,8 +1991,13 @@ export interface ReopenStep {
   valve: string;
   /** 本步开启后按现有共享容量模型重算的总获配量 */
   totalAllocated: number;
-  /** 截至本步各步总获配量之和（累计获配） */
-  cumulativeAllocated: number;
+  /**
+   * 截至本步各步总获配量之和（累计获配）。
+   * 单步获配均为安全整数，但至多 MAX_REOPEN_VALVES 步累加可能达到
+   * 8 × MAX_SAFE_INTEGER：安全范围内为 number，超出时为完整十进制字符串
+   * （逐位精确，不做 Number 舍入）。
+   */
+  cumulativeAllocated: number | string;
 }
 
 export interface ReopenOk {
@@ -1967,8 +2014,13 @@ export interface ReopenOk {
   finalOrder: string[];
   /** 全部待开阀门开启后的总获配量（= 最后一步总获配） */
   finalAllocated: number;
-  /** 规划目标值：各步总获配量之和（= 最后一步累计获配） */
-  objective: number;
+  /**
+   * 规划目标值：各步总获配量之和（= 最后一步累计获配）。
+   * 单步获配均为安全整数，但最多 MAX_REOPEN_VALVES 步累加后可能超出
+   * Number 安全整数范围：安全范围内为 number，超出时为完整十进制字符串
+   * （逐位精确，不做 Number 舍入）。
+   */
+  objective: number | string;
 }
 
 /** 待开清单为空：无需复水。 */
@@ -2062,15 +2114,19 @@ export function planReopenSequence(network: Network, query: CapacityQuery): Reop
   // 任意顺序的最后一步开完即集合 S，此前是 S\{v} 的某个顺序，故
   // f(S) = allocated(S) + max_{v∈S} f(S\{v})；同分保留完整开阀序列字典序最小者
   // （不同候选的前缀集合不同，完整序列的字典序由前缀决定，子问题最优解可直接拼接）。
-  const bestValue: number[] = new Array(subsetCount).fill(0);
+  // 单步获配是安全整数，但至多 MAX_REOPEN_VALVES 步相加可能超出 Number 安全整数
+  // 范围（如 8 步各为 9007199254740991），目标值全程以 BigInt 精确累加与比较，
+  // 避免 Number 舍入改变最优顺序或展示出错误的累计获配。
+  const allocatedExact = allocated.map((x) => BigInt(x));
+  const bestValue: bigint[] = new Array(subsetCount).fill(0n);
   const bestSeq: string[][] = new Array(subsetCount).fill([]);
   for (let mask = 1; mask < subsetCount; mask++) {
-    let value = -1;
+    let value = -1n;
     let seq: string[] = [];
     for (let i = 0; i < n; i++) {
       if (!(mask & (1 << i))) continue;
       const prev = mask ^ (1 << i);
-      const candidateValue = bestValue[prev] + allocated[mask];
+      const candidateValue = bestValue[prev] + allocatedExact[mask];
       const candidateSeq = [...bestSeq[prev], closedValves[i]];
       if (
         candidateValue > value ||
@@ -2088,15 +2144,15 @@ export function planReopenSequence(network: Network, query: CapacityQuery): Reop
   const finalOrder = bestSeq[fullMask];
   const steps: ReopenStep[] = [];
   let mask = 0;
-  let cumulative = 0;
+  let cumulative = 0n;
   finalOrder.forEach((valve, idx) => {
     mask |= 1 << bitOf.get(valve)!;
-    cumulative += allocated[mask];
+    cumulative += allocatedExact[mask];
     steps.push({
       step: idx + 1,
       valve,
       totalAllocated: allocated[mask],
-      cumulativeAllocated: cumulative,
+      cumulativeAllocated: exactIntegerOutput(cumulative),
     });
   });
 
@@ -2108,7 +2164,7 @@ export function planReopenSequence(network: Network, query: CapacityQuery): Reop
     steps,
     finalOrder,
     finalAllocated: allocated[fullMask],
-    objective: bestValue[fullMask],
+    objective: exactIntegerOutput(bestValue[fullMask]),
   };
 }
 
@@ -2293,11 +2349,20 @@ export function parseWorkPassage(raw: unknown): { passage?: WorkPassage; errors:
 }
 
 /**
+ * 精确非负整数合计的输出形式：不超出 Number 安全整数范围时保留 number
+ * （与既有结果兼容），超出时给完整十进制数字字符串，保证逐位精确、可直接展示，
+ * 绝不返回经 Number 舍入的值。
+ */
+function exactIntegerOutput(value: bigint): number | string {
+  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString(10);
+}
+
+/**
  * 精确分钟值的输出形式：不超出 Number 安全整数范围时保留 number（与普通分钟
  * 输入的既有结果兼容），超出时给完整十进制数字字符串，保证逐位精确、可直接展示。
  */
 function exactMinutesOutput(value: bigint): number | string {
-  return value <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(value) : value.toString(10);
+  return exactIntegerOutput(value);
 }
 
 /**

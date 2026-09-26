@@ -389,6 +389,134 @@ check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
 const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
 check('字符串需求量被拒绝', ce8.status === 'invalid');
 
+console.log('核验：供给上限合计 / 出口需求合计的安全整数边界：');
+const SAFE_MAX = Number.MAX_SAFE_INTEGER; // 9007199254740991
+// 注意：精确合计 27021597764222973 超出安全整数范围，JS 中 3*SAFE_MAX 会被
+// Number 舍入为 27021597764222976——断言必须使用精确十进制字面量，不能用
+// String(3*SAFE_MAX)（那正是本次修复要消除的舍入）。
+const THREE_SAFE_MAX_EXACT = '27021597764222973';
+// 三个互不连通出口各需安全整数上限：单项合法，但 Number 累加会舍入（精确合计
+// 27021597764222973，Number 合计被舍入），共用校验须精确拒绝而非给出错误缺口
+const disjointNet = {
+  nodes: ['SA', 'SB', 'SC', 'OA', 'OB', 'OC'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'VA', from: 'SA', to: 'OA', open: true },
+    { id: 'VB', from: 'SB', to: 'OB', open: true },
+    { id: 'VC', from: 'SC', to: 'OC', open: true },
+  ],
+};
+const bigDemandQuery = {
+  supplies: ['SA', 'SB', 'SC'], outlets: ['OA', 'OB', 'OC'],
+  supplyCaps: { SA: 1, SB: 1, SC: 1 },
+  outletDemands: { OA: SAFE_MAX, OB: SAFE_MAX, OC: SAFE_MAX },
+};
+const bd1 = solver.verifyCapacity(disjointNet, bigDemandQuery);
+check('需求合计超出安全整数范围时核验被拒绝', bd1.status === 'invalid');
+check('拒绝信息明确指出类别为出口需求量合计', bd1.status === 'invalid' &&
+  bd1.errors.some((e) => e.includes('需求量合计') && e.includes(THREE_SAFE_MAX_EXACT)));
+check('拒绝信息不含供给类别', bd1.status === 'invalid' &&
+  !bd1.errors.some((e) => e.includes('供给上限合计')));
+check('被拒绝时不返回任何业务结论（无 totalDemand 字段）',
+  bd1.status === 'invalid' && bd1.totalDemand === undefined);
+
+// 同类风险：多个供水点上限合计超出安全整数范围
+const bigSupplyQuery = {
+  supplies: ['SA', 'SB', 'SC'], outlets: ['OA'],
+  supplyCaps: { SA: SAFE_MAX, SB: SAFE_MAX, SC: SAFE_MAX },
+  outletDemands: { OA: 1 },
+};
+const shareNet = {
+  nodes: ['SA', 'SB', 'SC', 'M', 'OA'],
+  pipes: [{ id: 'P1', from: 'M', to: 'OA' }],
+  valvedPipes: [
+    { id: 'VA', from: 'SA', to: 'M', open: true },
+    { id: 'VB', from: 'SB', to: 'M', open: true },
+    { id: 'VC', from: 'SC', to: 'M', open: true },
+  ],
+};
+const bs1 = solver.verifyCapacity(shareNet, bigSupplyQuery);
+check('供给上限合计超出安全整数范围时核验被拒绝', bs1.status === 'invalid');
+check('拒绝信息明确指出类别为供给上限合计', bs1.status === 'invalid' &&
+  bs1.errors.some((e) => e.includes('供给上限合计') && e.includes(THREE_SAFE_MAX_EXACT)));
+
+// 合计恰好等于安全整数上限：精确可表示，仍可计算。
+// 用 3 条并行单位管承载大流量，避免被单管容量 1 卡住。
+const exactSumNet = {
+  nodes: ['SA', 'SB', 'OA', 'OB'],
+  pipes: [],
+  valvedPipes: [
+    ...Array.from({ length: 3 }, (_, i) => ({ id: `VA${i}`, from: 'SA', to: 'OA', open: true })),
+    ...Array.from({ length: 3 }, (_, i) => ({ id: `VB${i}`, from: 'SB', to: 'OB', open: true })),
+  ],
+};
+const es1 = solver.verifyCapacity(exactSumNet, {
+  supplies: ['SA', 'SB'], outlets: ['OA', 'OB'],
+  supplyCaps: { SA: SAFE_MAX - 1, SB: 1 },
+  outletDemands: { OA: SAFE_MAX - 2, OB: 2 },
+});
+check('供给上限合计恰为安全整数上限时仍可计算', es1.status === 'ok' &&
+  es1.totalSupplyCap === SAFE_MAX);
+check('需求合计恰为安全整数上限时仍可计算', es1.status === 'ok' &&
+  es1.totalDemand === SAFE_MAX);
+// OA 经 3 条并行管从 SA 最多获配 3，OB 从 SB 获配 1：总获配 4、缺口 = SAFE_MAX - 4
+check('恰为上限时总获配与缺口精确（无舍入）', es1.status === 'ok' &&
+  es1.totalAllocated === 4 && es1.totalShortfall === SAFE_MAX - 4);
+
+// 合计仅超过 1（SAFE_MAX + 1）也要拒绝；这正是 Number 9007199254740991+1
+// 舍入为偶数的临界场景
+const overByOne = solver.verifyCapacity(exactSumNet, {
+  supplies: ['SA', 'SB'], outlets: ['OA', 'OB'],
+  supplyCaps: { SA: 1, SB: 1 },
+  outletDemands: { OA: SAFE_MAX, OB: 1 },
+});
+check('需求合计仅超出 1（9007199254740992）时被拒绝', overByOne.status === 'invalid' &&
+  overByOne.errors.some((e) => e.includes('9007199254740992')));
+
+// 单项错误与合计错误同时存在时，保留原有单项报错
+const bothErr = solver.verifyCapacity(disjointNet, {
+  supplies: ['SA', 'SB', 'SC'], outlets: ['OA', 'OB', 'OC'],
+  supplyCaps: { SA: SAFE_MAX, SB: SAFE_MAX, SC: -1 },
+  outletDemands: { OA: SAFE_MAX, OB: SAFE_MAX, OC: SAFE_MAX },
+});
+check('单项非法时报单项错误（不继续累加合计）', bothErr.status === 'invalid' &&
+  bothErr.errors.some((e) => e.includes('非负整数')) &&
+  !bothErr.errors.some((e) => e.includes('供给上限合计')));
+
+// 去重后累计：供水点 / 出口名单重复时只按去重后的一份数值合计
+// （不去重会把 SA 的上限、OA 的需求各算两次，得到 2·SAFE_MAX，被误判超限）
+const dupQuery = solver.verifyCapacity(exactSumNet, {
+  supplies: ['SA', 'SB', 'SA'], outlets: ['OA', 'OB', 'OA'],
+  supplyCaps: { SA: SAFE_MAX, SB: 0 },
+  outletDemands: { OA: SAFE_MAX, OB: 0 },
+});
+check('名单重复去重后合计恰为安全整数上限，仍可计算', dupQuery.status === 'ok' &&
+  dupQuery.totalSupplyCap === SAFE_MAX && dupQuery.totalDemand === SAFE_MAX);
+
+// 六个共用功能在合计超限时行为一致：均拒绝、均不返回业务结论
+const sharedReject = [
+  ['重点优先配水', () => solver.verifyPriorityCapacity(disjointNet, { ...bigDemandQuery, priorityOutlets: ['OA'] })],
+  ['增容建议', () => solver.suggestExpansion(disjointNet, bigDemandQuery)],
+  ['双阀风险', () => solver.scanValveClosureRisk(disjointNet, bigDemandQuery)],
+  ['复水顺序', () => solver.planReopenSequence(disjointNet, bigDemandQuery)],
+];
+for (const [label, fn] of sharedReject) {
+  const r = fn();
+  check(`${label}沿用共用校验：需求合计超限时拒绝`, r.status === 'invalid');
+  check(`${label}沿用共用校验：错误标明出口需求量合计类别`, r.status === 'invalid' &&
+    r.errors.some((e) => e.includes('需求量合计')));
+}
+// 应急送水布点：先做一次供水能力核验，超限错误须原样透传
+const edReject = solver.planEmergencyDeliveryStations(disjointNet, {
+  ...bigDemandQuery,
+  stations: [{ name: 'WP', capacity: 1 }],
+  maxWalkMinutes: 0,
+  outletWaypoints: { OA: 'WP', OB: 'WP', OC: 'WP' },
+  passage: { waypoints: ['WP'], passages: [], valveWaypoints: {} },
+});
+check('应急送水布点沿用共用校验：需求合计超限时拒绝并透传类别错误',
+  edReject.status === 'invalid' && edReject.errors.some((e) => e.includes('需求量合计')));
+
 // ============ 重点出口优先配水 ============
 console.log('重点出口优先配水：');
 
@@ -1044,6 +1172,33 @@ check('缺少出口时报错', roe3.status === 'invalid');
 const beforeReopen = JSON.stringify(reopenNet);
 solver.planReopenSequence(reopenNet, { supplies: ['S'], outlets: ['O'], supplyCaps: { S: 5 }, outletDemands: { O: 5 } });
 check('规划不修改输入网络与登记状态', JSON.stringify(reopenNet) === beforeReopen);
+
+console.log('复水规划：累计获配 / 目标值的精确整数（内部 BigInt 累加）：');
+// 两条已关并联单位管：供给上限与需求均为安全整数上限；每开一条总获配 +1，
+// 单步获配（1、2）很小，此例验证累计值仍按 number 返回、结论精确
+const bigReopenNet = {
+  nodes: ['S', 'O'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'O', open: false },
+    { id: 'V2', from: 'S', to: 'O', open: false },
+  ],
+};
+const bro = reopen(bigReopenNet, ['S'], ['O'], { S: SAFE_MAX }, { O: SAFE_MAX });
+check('上限为安全整数时规划返回 ok', bro.status === 'ok');
+check('各步总获配 1、2，累计获配 1、3（number 精确）',
+  bro.steps.map((s) => `${s.totalAllocated}/${s.cumulativeAllocated}`).join(',') === '1/1,2/3');
+check('目标值 3 为 number', bro.objective === 3);
+
+// 复水规划同样沿用共用校验：供给 / 需求合计超限即拒绝，不算目标值
+const broBad = solver.planReopenSequence(bigReopenNet, {
+  supplies: ['S'], outlets: ['O'],
+  supplyCaps: { S: SAFE_MAX },
+  outletDemands: { O: SAFE_MAX + 2 }, // 单项已非安全整数（9007199254740993 无法精确表示）
+});
+// SAFE_MAX + 2 在 JS 中舍入为 SAFE_MAX，须经单项安全整数校验拒绝
+check('单项非安全整数仍由原有单项校验拒绝', broBad.status === 'invalid' &&
+  broBad.errors.some((e) => e.includes('非负整数')));
 
 // ============ 关阀作业路线 ============
 console.log('关阀作业路线：');
