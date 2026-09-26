@@ -389,6 +389,143 @@ check('缺少某供水点上限被拒绝', ce7.status === 'invalid');
 const ce8 = cap(['S1'], ['B'], { S1: 1 }, { B: '2' });
 check('字符串需求量被拒绝', ce8.status === 'invalid');
 
+console.log('核验：合计超出安全整数范围时精确拒绝（单项各自合法）：');
+// 三个互不连通出口的需求各填安全整数上限：Number 直接累加会舍入少 1（27021597764222973 → …972），
+// 缺口随之错误；共用校验必须精确累计去重后的合计并明确指出类别后拒绝计算。
+const SAFE_MAX = 9007199254740991;
+const OVERFLOW_TOTAL = '27021597764222973'; // 3 × 9007199254740991 的精确值（BigInt）
+const splitNet = {
+  nodes: ['S1', 'S2', 'S3', 'O1', 'O2', 'O3'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S1', to: 'O1', open: true },
+    { id: 'V2', from: 'S2', to: 'O2', open: true },
+    { id: 'V3', from: 'S3', to: 'O3', open: true },
+  ],
+};
+const co1 = solver.verifyCapacity(splitNet, {
+  supplies: ['S1', 'S2', 'S3'], outlets: ['O1', 'O2', 'O3'],
+  supplyCaps: { S1: SAFE_MAX, S2: SAFE_MAX, S3: SAFE_MAX },
+  outletDemands: { O1: SAFE_MAX, O2: SAFE_MAX, O3: SAFE_MAX },
+});
+check('供给与需求合计均超限时拒绝', co1.status === 'invalid' &&
+  co1.errors.some((e) => e.includes('供给上限合计') && e.includes(OVERFLOW_TOTAL)) &&
+  co1.errors.some((e) => e.includes('需求量合计') && e.includes(OVERFLOW_TOTAL)));
+check('拒绝信息给出安全整数上界', co1.errors.every((e) => e.includes(String(SAFE_MAX))));
+check('超限时不返回任何业务结论（无总缺口字段）', !('totalShortfall' in co1));
+
+const co2 = solver.verifyCapacity(splitNet, {
+  supplies: ['S1'], outlets: ['O1', 'O2', 'O3'],
+  supplyCaps: { S1: SAFE_MAX },
+  outletDemands: { O1: SAFE_MAX, O2: SAFE_MAX, O3: SAFE_MAX },
+});
+check('仅需求合计超限时明确指出类别为需求量', co2.status === 'invalid' &&
+  co2.errors.some((e) => e.includes('需求量合计')) &&
+  !co2.errors.some((e) => e.includes('供给上限合计')));
+
+const co3 = solver.verifyCapacity(splitNet, {
+  supplies: ['S1', 'S2', 'S3'], outlets: ['O1'],
+  supplyCaps: { S1: SAFE_MAX, S2: SAFE_MAX, S3: SAFE_MAX },
+  outletDemands: { O1: SAFE_MAX },
+});
+check('仅供给合计超限时明确指出类别为供给上限', co3.status === 'invalid' &&
+  co3.errors.some((e) => e.includes('供给上限合计')) &&
+  !co3.errors.some((e) => e.includes('需求量合计')));
+
+console.log('核验：合计恰好等于安全整数上限仍可计算（不额外舍入）：');
+const boundNet = {
+  nodes: ['SA', 'SB', 'O1', 'O2'],
+  pipes: [],
+  valvedPipes: [
+    ...Array.from({ length: 4 }, (_, i) => ({ id: `VA${i}`, from: 'SA', to: 'O1', open: true })),
+    ...Array.from({ length: 4 }, (_, i) => ({ id: `VB${i}`, from: 'SB', to: 'O2', open: true })),
+  ],
+};
+const cb1 = solver.verifyCapacity(boundNet, {
+  supplies: ['SA', 'SB'], outlets: ['O1', 'O2'],
+  supplyCaps: { SA: SAFE_MAX - 1, SB: 1 },
+  outletDemands: { O1: 1, O2: SAFE_MAX - 1 },
+});
+check('供给合计恰为上界时返回 ok', cb1.status === 'ok' &&
+  cb1.totalSupplyCap === SAFE_MAX && cb1.totalDemand === SAFE_MAX);
+check('恰为上界时总获配 2、总缺口精确（未被舍入）',
+  cb1.totalAllocated === 2 && cb1.totalShortfall === SAFE_MAX - 2);
+
+// 需求去重后合计恰为上界：名单重复不应把同一需求累计两次
+const cb2 = solver.verifyCapacity(boundNet, {
+  supplies: ['SA', 'SB'], outlets: ['O1', 'O1', 'O2'],
+  supplyCaps: { SA: 1, SB: SAFE_MAX - 1 },
+  outletDemands: { O1: 1, O2: SAFE_MAX - 1 },
+});
+check('出口重复时按去重后需求合计校验（恰为上界可计算）', cb2.status === 'ok' &&
+  cb2.totalDemand === SAFE_MAX);
+
+// 去重后合计恰好超限 1：两个上限 (SAFE_MAX-1) + 2 = SAFE_MAX + 1
+const cb3 = solver.verifyCapacity(boundNet, {
+  supplies: ['SA', 'SB'], outlets: ['O1', 'O2'],
+  supplyCaps: { SA: SAFE_MAX - 1, SB: 2 },
+  outletDemands: { O1: 1, O2: 1 },
+});
+check('供给合计超出上界 1 时仍拒绝', cb3.status === 'invalid' &&
+  cb3.errors.some((e) => e.includes('供给上限合计') && e.includes('9007199254740992')));
+
+// 单项非法与合计超限并存时保留单项报错（页面现有单项报错不丢失）
+const co4 = solver.verifyCapacity(splitNet, {
+  supplies: ['S1', 'S2', 'S3'], outlets: ['O1', 'O2', 'O3'],
+  supplyCaps: { S1: SAFE_MAX, S2: SAFE_MAX, S3: -1 },
+  outletDemands: { O1: SAFE_MAX, O2: SAFE_MAX, O3: SAFE_MAX },
+});
+check('单项非法时报单项错误且不堆叠合计错误', co4.status === 'invalid' &&
+  co4.errors.some((e) => e.includes('非负整数')) &&
+  !co4.errors.some((e) => e.includes('合计')));
+
+console.log('核验：共用合计校验被重点配水 / 增容 / 双阀 / 复水 / 应急送水沿用：');
+const overflowQuery = {
+  supplies: ['S1', 'S2', 'S3'], outlets: ['O1', 'O2', 'O3'],
+  supplyCaps: { S1: SAFE_MAX, S2: SAFE_MAX, S3: SAFE_MAX },
+  outletDemands: { O1: SAFE_MAX, O2: SAFE_MAX, O3: SAFE_MAX },
+};
+const cp1 = solver.verifyPriorityCapacity(splitNet, overflowQuery);
+check('重点优先配水沿用合计校验（拒绝且不展示业务结论）',
+  cp1.status === 'invalid' && cp1.errors.some((e) => e.includes('需求量合计')) &&
+  !('totalAllocated' in cp1));
+const cp2 = solver.suggestExpansion(splitNet, overflowQuery);
+check('增容建议沿用合计校验', cp2.status === 'invalid' &&
+  cp2.errors.some((e) => e.includes('需求量合计')));
+const cp3 = solver.scanValveClosureRisk(splitNet, overflowQuery);
+check('双阀风险扫描沿用合计校验', cp3.status === 'invalid' &&
+  cp3.errors.some((e) => e.includes('需求量合计')));
+// 复水：构造登记为关闭的阀门（不影响校验先于待开清单检查的顺序）
+const splitNetClosed = {
+  nodes: splitNet.nodes,
+  pipes: [],
+  valvedPipes: splitNet.valvedPipes.map((v) => ({ ...v, open: false })),
+};
+const cp4 = solver.planReopenSequence(splitNetClosed, overflowQuery);
+check('复水顺序沿用合计校验（先于待开清单判定拒绝）', cp4.status === 'invalid' &&
+  cp4.errors.some((e) => e.includes('需求量合计')));
+const cp5 = solver.planEmergencyDeliveryStations(splitNet, {
+  ...overflowQuery,
+  stations: [{ name: '站', capacity: 1 }],
+  maxWalkMinutes: 1,
+  outletWaypoints: {},
+  passage: { waypoints: ['站'], passages: [], valveWaypoints: {} },
+});
+check('应急送水布点沿用合计校验（经供水能力核验拒绝）', cp5.status === 'invalid' &&
+  cp5.errors.some((e) => e.includes('需求量合计')));
+// 合计恰为上界时其余能力查询同样可计算（不展示任何舍入结论）
+const boundQuery = {
+  supplies: ['SA', 'SB'], outlets: ['O1', 'O2'],
+  supplyCaps: { SA: SAFE_MAX - 1, SB: 1 },
+  outletDemands: { O1: 1, O2: SAFE_MAX - 1 },
+};
+check('合计恰为上界时重点配水仍可计算',
+  solver.verifyPriorityCapacity(boundNet, boundQuery).status === 'ok');
+check('合计恰为上界时增容建议仍可计算',
+  solver.suggestExpansion(boundNet, boundQuery).status === 'ok');
+check('合计恰为上界时双阀风险仍可计算',
+  solver.scanValveClosureRisk(boundNet, boundQuery).status === 'ok');
+
 // ============ 重点出口优先配水 ============
 console.log('重点出口优先配水：');
 

@@ -931,12 +931,27 @@ function readNonNegativeInt(value: unknown): { ok: true; n: number } | { ok: fal
 interface ValidatedCapacityQuery {
   supplyCapList: { supply: string; cap: number }[];
   demandList: { outlet: string; demand: number }[];
+  /** 去重后供给上限精确合计（已保证不超出安全整数范围） */
+  totalSupplyCap: number;
+  /** 去重后出口需求精确合计（已保证不超出安全整数范围） */
+  totalDemand: number;
 }
 
 /**
- * 供水能力类查询（核验与增容建议共用）的校验：节点存在性、
- * 供给上限与需求量必须为非负整数。
+ * 供给上限 / 出口需求允许的合计上界（Number.MAX_SAFE_INTEGER）：
+ * 单项各自为安全整数时，多项之和仍可能超出本上界，普通 Number 累加会舍入。
+ */
+const MAX_CAPACITY_TOTAL = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * 供水能力类查询（核验、重点优先配水、增容建议、双阀风险、复水顺序与应急送水
+ * 布点共用）的校验：节点存在性、供给上限与需求量必须为非负整数。
  * 返回按输入顺序去重后的上限 / 需求清单；有错误时 valid 缺省。
+ *
+ * 单项校验之外，再以 BigInt **精确累计去重后的供给上限合计与出口需求合计**：
+ * 任一类合计超出安全整数范围（9007199254740991）时明确指出类别并拒绝计算——
+ * 如三个互不连通出口的需求各填 9007199254740991，Number 累加会舍入少 1，
+ * 进而算出错误的缺口；合计恰好等于上界仍可计算（精确、无舍入）。
  */
 function validateCapacityQuery(
   network: Network,
@@ -958,6 +973,8 @@ function validateCapacityQuery(
   const outlets = uniquePreservingOrder(query.outlets);
 
   const supplyCapList: { supply: string; cap: number }[] = [];
+  // 以 BigInt 精确累计，避免 9007199254740991 + 9007199254740991 之类的 Number 舍入
+  let supplyCapSum = 0n;
   for (const s of supplies) {
     if (!nodeSet.has(s)) continue;
     const raw = hasOwnKey(query.supplyCaps, s) ? query.supplyCaps[s] : undefined;
@@ -971,9 +988,11 @@ function validateCapacityQuery(
       continue;
     }
     supplyCapList.push({ supply: s, cap: parsed.n });
+    supplyCapSum += BigInt(parsed.n);
   }
 
   const demandList: { outlet: string; demand: number }[] = [];
+  let demandSum = 0n;
   for (const o of outlets) {
     if (!nodeSet.has(o)) continue;
     const raw = hasOwnKey(query.outletDemands, o) ? query.outletDemands[o] : undefined;
@@ -987,10 +1006,35 @@ function validateCapacityQuery(
       continue;
     }
     demandList.push({ outlet: o, demand: parsed.n });
+    demandSum += BigInt(parsed.n);
+  }
+
+  // 合计边界：仅在单项全部合法后检查，避免与单项报错重复堆叠
+  if (errors.length === 0) {
+    if (supplyCapSum > MAX_CAPACITY_TOTAL) {
+      errors.push(
+        `全部供水点的供给上限合计为 ${supplyCapSum.toString(10)}，超出安全整数上界 ` +
+        `${Number.MAX_SAFE_INTEGER}，无法精确计算总供给与缺口；请调小各项供给上限后重试。`
+      );
+    }
+    if (demandSum > MAX_CAPACITY_TOTAL) {
+      errors.push(
+        `全部保供出口的需求量合计为 ${demandSum.toString(10)}，超出安全整数上界 ` +
+        `${Number.MAX_SAFE_INTEGER}，无法精确计算总需求与缺口；请调小各项需求量后重试。`
+      );
+    }
   }
 
   if (errors.length > 0) return { errors };
-  return { valid: { supplyCapList, demandList }, errors: [] };
+  return {
+    valid: {
+      supplyCapList,
+      demandList,
+      totalSupplyCap: Number(supplyCapSum),
+      totalDemand: Number(demandSum),
+    },
+    errors: [],
+  };
 }
 
 /**
@@ -1040,6 +1084,12 @@ function computeTotalAllocated(
  * - 出口 → 超级汇点：容量为该出口的需求量。
  * 多供水点上限与多出口需求经最大流同时约束。最小割中饱和跨越的弧即瓶颈项目。
  * 纯函数，不修改输入。
+ *
+ * 数值边界：单项供给上限 / 需求量须为不超过 9007199254740991 的非负整数；
+ * 去重后的供给上限合计 / 需求合计以 BigInt 精确累计，任一类合计严格超出
+ * 9007199254740991 即返回 invalid 并指出类别（合计恰为上界仍可计算）。
+ * 该合计校验为全部供水能力类功能（核验、重点优先配水、增容建议、双阀风险、
+ * 复水顺序、应急送水布点）共用，超限时不产出任何经 Number 舍入的业务结论。
  */
 export function verifyCapacity(network: Network, query: CapacityQuery): CapacityResult {
   const { valid, errors } = validateCapacityQuery(network, query);
@@ -1141,8 +1191,8 @@ export function verifyCapacity(network: Network, query: CapacityQuery): Capacity
     return a.id.localeCompare(b.id, 'zh-Hans-CN');
   });
 
-  const totalSupplyCap = supplyCapList.reduce((sum, x) => sum + x.cap, 0);
-  const totalDemand = demandList.reduce((sum, x) => sum + x.demand, 0);
+  const totalSupplyCap = valid.totalSupplyCap;
+  const totalDemand = valid.totalDemand;
   const cutCapacity = cutItems.reduce((sum, x) => sum + x.capacity, 0);
 
   return {
@@ -1261,8 +1311,8 @@ export function verifyPriorityCapacity(network: Network, query: CapacityQuery): 
   });
 
   const sum = (xs: number[]): number => xs.reduce((a, b) => a + b, 0);
-  const totalSupplyCap = sum(supplyCapList.map((x) => x.cap));
-  const totalDemand = sum(demandList.map((x) => x.demand));
+  const totalSupplyCap = valid.totalSupplyCap;
+  const totalDemand = valid.totalDemand;
   const priorityDemand = sum(demandList.filter((d) => prioritySet.has(d.outlet)).map((d) => d.demand));
   const normalAllocated = sum(
     rows.filter((r) => r.category === 'normal').map((r) => r.allocated)
